@@ -507,8 +507,8 @@ def chunk_gated_delta_rule_opt_vk(
             state is read from, and the final state written back to,
             ``initial_state`` in place at these slots (paged / radix cache),
             instead of treating ``initial_state`` as a dense per-sequence
-            [N, H, V, K] buffer. Only supported on the Triton hidden-state path
-            (raises with use_chunk_hip / use_chunk_flydsl).
+            [N, H, V, K] buffer. The Triton path does a true in-kernel scatter;
+            the HIP / FlyDSL paths emulate it (gather before / scatter after).
         return_h (bool): if True, also return the per-chunk hidden-state
             snapshots ``h`` [B, NT, H, V, K] (V-major), for chunk-boundary
             SSM-state tracking (radix / prefix cache). Default: False.

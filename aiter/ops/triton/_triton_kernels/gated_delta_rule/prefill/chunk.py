@@ -267,10 +267,10 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         initial_state_indices: optional [N] int slot indices into the
             ``initial_state`` recurrent-state pool. When given, the hidden state
             is read from, and the final state written back to, ``initial_state``
-            in place at these slots (paged / radix cache) via an in-kernel
-            scatter, instead of treating ``initial_state`` as a dense
-            per-sequence [N, H, V, K] buffer. Only supported on the Triton
-            hidden-state path (raises with use_chunk_hip / use_chunk_flydsl).
+            in place at these slots (paged / radix cache), instead of treating
+            ``initial_state`` as a dense per-sequence [N, H, V, K] buffer. The
+            Triton path does a true in-kernel scatter; the HIP / FlyDSL paths
+            emulate it (gather the slots before, scatter the final state after).
         return_h: if True, also return the per-chunk hidden-state snapshots
             ``h`` [B, NT, H, V, K] (V-major), for chunk-boundary SSM-state
             tracking (radix / prefix cache).
@@ -291,11 +291,22 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     if use_chunk_hip and (_is_gfx12_runtime() or num_decodes > 0):
         use_chunk_hip = False
 
-    if initial_state_indices is not None and (use_chunk_hip or use_chunk_flydsl):
-        raise ValueError(
-            "initial_state_indices (in-place state scatter) is only supported on "
-            "the Triton VK hidden-state path; disable use_chunk_hip/use_chunk_flydsl."
-        )
+    # The Triton VK h-scan scatters into the state pool in-kernel (true in place,
+    # no copy). The HIP / FlyDSL h-scans take a dense per-sequence [N, H, V, K]
+    # state and don't index a pool, so when initial_state_indices is given we
+    # emulate the scatter around them: gather the requested pool slots into a
+    # dense buffer, run the kernel, then write the final state back to those
+    # slots. The gather/scatter copies are small ([N, H, V, K]) vs the chunk
+    # compute.
+    emulate_scatter = initial_state_indices is not None and (
+        use_chunk_hip or use_chunk_flydsl
+    )
+    state_pool = None
+    hs_initial_state = initial_state
+    if emulate_scatter:
+        state_pool = initial_state
+        idx_long = initial_state_indices.to(torch.long)
+        hs_initial_state = state_pool.index_select(0, idx_long)
 
     g_cumsum, A_raw = fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
         k=k,
@@ -329,8 +340,8 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             w=w,
             u=u,
             g=g_cumsum,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
+            initial_state=hs_initial_state,
+            output_final_state=output_final_state or emulate_scatter,
             cu_seqlens=cu_seqlens,
             state_dtype=state_dtype,
             use_exp2=use_exp2,
@@ -350,8 +361,8 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             w=w,
             u=u,
             g=g_cumsum,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
+            initial_state=hs_initial_state,
+            output_final_state=output_final_state or emulate_scatter,
             cu_seqlens=cu_seqlens,
             state_dtype=state_dtype,
             use_exp2=use_exp2,
@@ -373,6 +384,13 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             num_decode_tokens=num_decode_tokens,
             initial_state_indices=initial_state_indices,
         )
+
+    if emulate_scatter:
+        # Write the dense final state back into the pool slots (in-place scatter
+        # emulation for the HIP / FlyDSL paths). Return the pool as final_state
+        # so callers observe the same in-place semantics as the Triton path.
+        state_pool[idx_long] = final_state.to(state_pool.dtype)
+        final_state = state_pool
 
     if o is None:
         # Output matches v's [B, T, H, V] layout.

@@ -1206,5 +1206,94 @@ def test_chunk_opt_vk_state_indices(
     assert_close("final_state", ht_dense, ht_idx, 0.005)
 
 
+@pytest.mark.parametrize(
+    ("backend", "seqlens", "Hg", "H", "K", "V", "dtype"),
+    [
+        pytest.param(*t, id="{}-seqlens{}-Hg{}-H{}-K{}-V{}-{}".format(*t))
+        for t in [
+            ("hip", [200, 64, 130], 16, 48, 128, 128, torch.bfloat16),
+            ("hip", [512, 512], 16, 48, 128, 128, torch.bfloat16),
+            ("hip", [777], 16, 48, 128, 128, torch.bfloat16),
+            ("flydsl", [200, 64, 130], 16, 48, 128, 128, torch.bfloat16),
+            ("flydsl", [512, 512], 16, 48, 128, 128, torch.bfloat16),
+            ("flydsl", [777], 16, 48, 128, 128, torch.bfloat16),
+        ]
+    ],
+)
+def test_chunk_opt_vk_state_indices_backends(
+    backend: str,
+    seqlens: list[int],
+    Hg: int,
+    H: int,
+    K: int,
+    V: int,
+    dtype: torch.dtype,
+):
+    """initial_state_indices on the HIP / FlyDSL h-scan backends. These kernels
+    take a dense per-sequence state, so opt_vk emulates the in-place scatter
+    (gather the pool slots -> run the kernel -> scatter the final state back).
+    The result must equal the dense path for the same logical state; return_h
+    must still expose [B, NT, H, V, K]. (HIP/FlyDSL need D=128, bf16.)"""
+    if K != 128 or V != 128 or dtype != torch.bfloat16:
+        pytest.skip(reason="HIP/FlyDSL h-scan requires D=128 and bfloat16")
+    torch.manual_seed(42)
+    N = len(seqlens)
+    T = sum(seqlens)
+    cu_seqlens = torch.tensor(
+        [0, *torch.tensor(seqlens).cumsum(0).tolist()], device=device, dtype=torch.int32
+    )
+    scale = K**-0.5
+    bkw = {"use_chunk_hip": True} if backend == "hip" else {"use_chunk_flydsl": True}
+
+    q = torch.randn(1, T, Hg, K, device=device, dtype=dtype)
+    k = torch.randn(1, T, Hg, K, device=device, dtype=dtype)
+    v = torch.randn(1, T, H, V, device=device, dtype=dtype)
+    g = F.logsigmoid(torch.rand(1, T, H, device=device, dtype=torch.float32))
+    beta = torch.rand(1, T, H, device=device, dtype=dtype).sigmoid()
+    st = torch.randn(N, H, V, K, device=device, dtype=torch.float32) * 0.1
+
+    o_dense, ht_dense = chunk_gated_delta_rule_opt_vk(
+        q=q.clone(),
+        k=k.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        scale=scale,
+        initial_state=st.clone(),
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=cu_seqlens,
+        state_dtype=torch.float32,
+        **bkw,
+    )
+
+    num_slots = N + 3
+    idx = torch.randperm(num_slots, device=device)[:N].to(torch.int32)
+    pool = torch.zeros(num_slots, H, V, K, device=device, dtype=torch.float32)
+    pool[idx.long()] = st.clone()
+    o_idx, _final, h = chunk_gated_delta_rule_opt_vk(
+        q=q.clone(),
+        k=k.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        scale=scale,
+        initial_state=pool,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=cu_seqlens,
+        state_dtype=torch.float32,
+        initial_state_indices=idx,
+        return_h=True,
+        **bkw,
+    )
+    ht_idx = pool[idx.long()]
+
+    NT = sum((s + 63) // 64 for s in seqlens)
+    assert tuple(h.shape) == (1, NT, H, V, K), f"h shape {tuple(h.shape)}"
+    assert_close("o", o_dense, o_idx, 0.005)
+    assert_close("final_state", ht_dense, ht_idx, 0.005)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
